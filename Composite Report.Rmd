@@ -1,0 +1,1162 @@
+---
+title: "Clinical Cascade Composite Indicator"
+subtitle: A Site-Level Report
+output:
+  html_document:
+    code_folding: hide
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+---
+
+## Introduction
+
+**Background**: PEPFAR MER indicators track various aspects of HIV/AIDS interventions. These indicators are numerous and diverse, which can overwhelm stakeholders trying to assess site performance.
+
+**Problem**: Using individual MER indicators to assess site performance is challenging due to the volume of data points. Fragmented data complicates efficient program evaluation and resource allocation.
+
+This site composite indicator aims at simplifying data interpretation to improve decision-making. It allows quick assessment of overall site performance and progress towards program goals.
+
+This is a site composite indicator report using principal component analysis to extract weights from main Monitoring, Evaluation, and Reporting (MER) clinical cascade indicators to aggregate indicators into one summary KPI. This analysis adapts a methodology described in OECD's *Handbook for Constructing Composite Indicators: Methodology and User Guide*.
+
+Calculations are from the MER Reference Guide and ICPI Continuity of Treatment Dashboard.
+
+### Contribution
+
+**Methods**: Randy Yee ([pcx5\@cdc.gov](mailto:pcx5@cdc.gov){.email}), Jennifer Favaloro
+
+**Verification and Validation**: Moyosola Bamidele (Nigeria), Dena Cherry-Brown
+
+**Guidance**: JP Abellera
+
+### References
+
+OECD/European Union/EC-JRC (2008), *Handbook on Constructing Composite Indicators: Methodology and User Guide*, OECD Publishing, Paris, <https://doi.org/10.1787/9789264043466-en>.
+
+### Dataset
+
+-   MER Structured Dataset (MSD) Site x IM
+-   CDC only (but can include other agencies upon request)
+
+### Variables
+
+| Testing |        Treatment        | Viral Suppression |
+|:-------:|:-----------------------:|:-----------------:|
+|  YIELD  |         LINKAGE         |    VL COVERAGE    |
+|         | CONTINUITY OF TREATMENT |  VL SUPPRESSION   |
+|         |        ML RATES         |                   |
+|         |      RETURNED RATE      |                   |
+
+### Implementation
+
+1.  Decide on a thematic framework to capture (ex. clinical cascade)
+
+2.  Use the cumulative results from the previous fiscal year to construct weights using PCA for the following year
+
+3.  For each subsequent qtr, apply those weights to each site's quarterly results and aggregate to get a summary score
+
+4.  Analyze PCA results as well as the resulting site lists with the analytic questions below
+
+### Analytic Questions
+
+Enhances clarity and utility of program monitoring efforts. Aids in identifying successful strategies and areas for improvement, leading to better resource allocation and health outcomes.
+
+-   Are weights generally the same from year to year or changing?
+-   Do the weights reflect your program's priorities?
+-   For composite numbers to make sense, you will need to look at them geographically and/or by organization over time, IDing the top and bottom 10 performing sites - what are they doing?
+-   What is average score and is it increasing over time?
+-   Which sites are improving, worsening, stable?
+
+```{r setup, include = F}
+
+options(scipen = 999)
+options(digits=3)
+options(dplyr.summarise.inform = FALSE)
+
+library(tidyverse)
+library(FactoMineR)
+library(factoextra)
+library(ggplot2)
+library(plotly)
+library(sf)
+library(mapview)
+library(DT)
+library(paletteer)
+library(ggthemes)
+library(ggrepel)
+library(ggridges)
+
+```
+
+## Methods
+
+### Data Management
+
+1.  Import
+
+-   Acquire a site-level MSD from DATIM or Panorama.
+-   Easier to get the MSD through DATIM Genie since you can filter operatingunit, indicator, and disaggregates beforehand.
+
+```{r data import}
+
+df <- read_delim("Data/Genie-SITE_IM-Zambia-frozen-2024-10-30.txt", 
+                 # "/t", 
+                 escape_double = FALSE,
+                 trim_ws = TRUE,
+                 col_types = cols(.default = col_character(), 
+                                  targets = col_double(),
+                                  qtr1 = col_double(),
+                                  qtr2 = col_double(),
+                                  qtr3 = col_double(),
+                                  qtr4 = col_double(),
+                                  cumulative = col_double()))
+
+```
+
+2.  Subsetting
+
+-   Remove unneeded columns and rows.
+-   Simplify TX labels
+-   Summarize the remaining data.
+
+```{r data wrangling}
+
+# You can use DATIM to do the initial filtering for CDC, indicators, and disaggs
+
+df1 <- df %>%
+  filter(funding_agency == "HHS/CDC") %>%
+  filter(sitetype == "Facility") %>%
+  select(-targets)
+
+
+# No treatment interruption data before 2020
+# Join in partner at the end (sites can switch partners)
+
+df2 <- df1 %>%
+  filter(indicator %in% c("HTS_TST", 
+                          "HTS_TST_POS",
+                          "TX_CURR",
+                          "TX_NEW",
+                          "TX_NET_NEW",
+                          "TX_RTT",
+                          "TX_ML",
+                          "TX_PVLS")) %>%
+  filter(standardizeddisaggregate %in% c("Total Numerator",
+                                         "Total Denominator",#
+                                         "Age/Sex/ARTNoContactReason/HIVStatus")) %>%
+  group_by(
+    facilityuid, sitename, psnu, psnuuid, indicator, standardizeddisaggregate, otherdisaggregate, fiscal_year
+  ) %>%
+  summarise(qtr1       = sum(qtr1, na.rm=T),
+            qtr2       = sum(qtr2, na.rm=T),
+            qtr3       = sum(qtr3, na.rm=T),
+            qtr4       = sum(qtr4, na.rm=T),
+            cumulative = sum(cumulative, na.rm=T)) %>%
+  ungroup() %>%
+  unite("CODE",
+        indicator:otherdisaggregate, 
+        sep = ";", 
+        remove = TRUE, 
+        na.rm = TRUE) %>%
+  unite("NAME", 
+        c(sitename, facilityuid, psnu, psnuuid), 
+        sep = ";") %>%
+  mutate(CODE = str_replace(CODE, "Age/Sex/ARTNoContactReason/HIVStatus;No Contact Outcome - ", "")) %>%
+  mutate(CODE = str_replace(CODE, "Interruption In Treatment", "IIT")) %>%
+  mutate(CODE = str_replace(CODE, "Interruption in Treatment", "IIT")) %>%
+  mutate(CODE = str_replace(CODE, " Months Treatment", "")) %>% 
+  mutate(CODE = str_replace(CODE, "Total ", ""))
+
+
+# Use cumulative for calculating annual weights for the next year
+# For IIT calculations, use qrters
+
+df3 <- df2 %>%
+  pivot_longer(qtr1:cumulative, names_to = "attribute", values_to = "result") %>%
+  filter(!str_detect(NAME, "Dedup")) %>% 
+  filter(result != 0) %>%
+  group_by(NAME, CODE, fiscal_year, attribute) %>%
+  summarise(result = sum(result, na.rm = T)) %>%
+  ungroup()
+
+```
+
+3.  Proxy Calculations
+
+------------------------------------------------------------------------
+
++-----------------------------------+------------------------------------------------------+
+| KPI                               | Formula                                              |
++===================================+======================================================+
+| Yield                             | HTS_TST_POS;Numerator/\                              |
+|                                   | HTS_TST;Numerator                                    |
++-----------------------------------+------------------------------------------------------+
+| Linkage                           | TX_NEW;Numerator/\                                   |
+|                                   | HTS_TST_POS;Numerator                                |
++-----------------------------------+------------------------------------------------------+
+| Continuity of Treatment (COT)     | TX_CURR;Numerator/\                                  |
+|                                   | (PREV_CURR +TX_NET_NEW;Numerator)                    |
++-----------------------------------+------------------------------------------------------+
+| Percent Loss/Gain                 | (TX_NET_NEW;Numerator-TX_NEW;Numerator) /\           |
+|                                   | TX_DENOM                                             |
++-----------------------------------+------------------------------------------------------+
+| Percent Patient Loss              | TX_ML;Numerator /\                                   |
+|                                   | TX_DENOM                                             |
++-----------------------------------+------------------------------------------------------+
+| Percent IIT \<3 Months            | TX_ML;IIT \<3 /\                                     |
+|                                   | ((TX_NEW;Numerator/4) + (PREV_NEW/2))                |
++-----------------------------------+------------------------------------------------------+
+| Percent IIT 3-5 Months            | TX_ML;IIT 3-5/\                                      |
+|                                   | ((PREV_NEW2/2) + (PREV_NEW\`/2))                     |
++-----------------------------------+------------------------------------------------------+
+| Percent IIT 6+ Months             | TX_ML;IIT 6+/\                                       |
+|                                   | PREV_CURR2                                           |
++-----------------------------------+------------------------------------------------------+
+| Percent Stopped/Refused Treatment | TX_ML;Refused Stopped Treatment/\                    |
+|                                   | TX_DENOM                                             |
++-----------------------------------+------------------------------------------------------+
+| Percent Died                      | TX_ML;Died/\                                         |
+|                                   | TX_DENOM                                             |
++-----------------------------------+------------------------------------------------------+
+| Percent Transferred Out           | TX_ML;Transferred Out/\                              |
+|                                   | TX_DENOM                                             |
++-----------------------------------+------------------------------------------------------+
+| Percent Returned                  | TX_RTT;Numerator/ (TX_ML;Numerator+TX_RTT;Numerator) |
++-----------------------------------+------------------------------------------------------+
+| Viral Load Coverage               | TX_PVLS (D)/\                                        |
+|                                   | PREV_CURR2                                           |
++-----------------------------------+------------------------------------------------------+
+| VL Suppression                    | TX_PVLS (N)/\                                        |
+|                                   | TX_PVLS (D)                                          |
++-----------------------------------+------------------------------------------------------+
+
+------------------------------------------------------------------------
+
+```{r TX periods}
+
+df4 <- df3 %>%
+  mutate(CODE = case_when(
+    CODE == "TX_CURR;Numerator" & attribute == "qtr3" ~"PREV_CURR",
+    CODE == "TX_CURR;Numerator" & attribute == "qtr2" ~"PREV_CURR2",
+    CODE == "TX_NEW;Numerator"  & attribute == "qtr3" ~"PREV_NEW",
+    CODE == "TX_NEW;Numerator"  & attribute == "qtr2" ~"PREV_NEW2",
+    TRUE ~CODE
+  )) %>%
+  # Filter for the rows with cumulative and the new PREV indicators
+  filter((CODE == "PREV_CURR" | CODE == "PREV_CURR2" | CODE == "PREV_NEW" | CODE == "PREV_NEW2") |
+           (CODE %in% c("HTS_TST;Numerator", 
+                        "HTS_TST_POS;Numerator", 
+                        "TX_CURR;Numerator",
+                        "TX_NEW;Numerator",
+                        "TX_NET_NEW;Numerator",
+                        "TX_ML;Numerator",
+                        "TX_ML;IIT <3",
+                        "TX_ML;IIT 3-5",
+                        "TX_ML;IIT 6+",
+                        "TX_ML;Refused Stopped Treatment",
+                        "TX_ML;Died",
+                        "TX_ML;Transferred Out",
+                        "TX_RTT;Numerator",
+                        "TX_PVLS;Numerator",
+                        "TX_PVLS;Denominator")) & attribute == "cumulative") %>%
+  rename("PERIOD" = "fiscal_year") %>%
+  select(-attribute) %>%
+  pivot_wider(id_cols = c("NAME", "PERIOD"), 
+              names_from = "CODE",
+              values_from = "result") %>%
+  filter(!str_detect(NAME, "Dedup")) %>%
+  group_by(NAME, PERIOD) %>%
+  summarise_all(list(sum),na.rm = T) %>%
+  ungroup()
+
+
+# Proxy calculations for testing and VL as outlined in the MER Reference Guide. 
+# Treatment calculations are from the Continuity of Treatment analysis (ICPI).
+# Linkage and VL_Suppression should be capped to 100%
+
+df5 <- df4 %>%
+  # Time Insensitive
+  mutate(YIELD           = `HTS_TST_POS;Numerator`/`HTS_TST;Numerator`,
+         LINKAGE         = `TX_NEW;Numerator`/`HTS_TST_POS;Numerator`,
+         #LINKAGE        = ifelse(LINKAGE>1, 1, LINKAGE),
+         
+         COT              = `TX_CURR;Numerator` / (PREV_CURR + `TX_NET_NEW;Numerator`),
+         TX_VOLUME        = `TX_CURR;Numerator`,
+         
+         TX_DENOM         = (`PREV_CURR` + `TX_NEW;Numerator`),
+         # This is the expected TX_CURR for the period
+         PER_LOSS_GAIN    = (`TX_NET_NEW;Numerator` - `TX_NEW;Numerator`) / `TX_DENOM`,
+         PER_PATIENT_LOSS = (`TX_ML;Numerator` / `TX_DENOM`),
+         PER_STOPPED      = (`TX_ML;Refused Stopped Treatment` / `TX_DENOM`),
+         PER_DIED         = (`TX_ML;Died` / `TX_DENOM`),
+         PER_TRANSFERRED  = (`TX_ML;Transferred Out` / `TX_DENOM`),
+         PER_IIT_LESS3    = (`TX_ML;IIT <3` / ((`TX_NEW;Numerator`/4) + (`PREV_NEW`/2))),
+         PER_IIT_3TO5     = (`TX_ML;IIT 3-5` / ((`PREV_NEW2`/2) + (`PREV_NEW`/2))),
+         PER_IIT_6PLUS    = (`TX_ML;IIT 6+` / `PREV_CURR2`),
+         PER_RETURNED     = (`TX_RTT;Numerator` / (`TX_ML;Numerator` + `TX_RTT;Numerator`)),
+         
+         VL_COVERAGE      = (`TX_PVLS;Denominator`/`PREV_CURR2`),
+         VL_SUPPRESSION  = `TX_PVLS;Numerator`/`TX_PVLS;Denominator`,
+         #VL_SUPPRESSION = ifelse(VL_SUPPRESSION>1, 1, VL_SUPPRESSION)
+  ) %>%
+  dplyr::select(NAME, 
+                PERIOD,
+                YIELD, 
+                LINKAGE,
+                
+                COT,
+                PER_LOSS_GAIN, # Same as % Proxy Loss
+                PER_PATIENT_LOSS,
+                PER_IIT_LESS3,
+                PER_IIT_3TO5,
+                PER_IIT_6PLUS,
+                PER_STOPPED,
+                PER_DIED,
+                PER_TRANSFERRED,
+                PER_RETURNED,
+                
+                VL_COVERAGE,
+                VL_SUPPRESSION) %>%
+  arrange(PERIOD)
+
+```
+
+4.  Missing Data
+
+-   Remove observations with NAs or Inf in any of their KPIs.
+
+```{r missing data}
+
+miss <- function(df){
+  
+  missdf <- df
+  
+  missdf[sapply(missdf, is.infinite)] <- NA
+  missdf1 <- missdf[complete.cases(missdf[, 3:ncol(missdf)]), ]
+  
+}
+
+df6 <- miss(df5)
+
+```
+
+5.  Qrtly Dataset Preparation
+
+-   We prepare the qrtly dataset in same way as before. The only difference is we'll be calculating the TX_ML percent change and VL coverage KPIs using each qtr as reference (i.e., TX_NEW and TX_CURR 1 & 2 qtrs back from each qtr).
+
+```{r df qrtly}
+
+df_qtrly <- df3 %>%
+  filter(attribute != "cumulative") %>%
+  unite("PERIOD",
+        c(fiscal_year, attribute),
+        remove = TRUE,
+        na.rm = TRUE) %>%
+  pivot_wider(id_cols = c("NAME", "PERIOD"), 
+              names_from = "CODE", 
+              values_from = "result") %>%
+  filter(!str_detect(NAME, "Dedup")) %>%  
+  group_by(NAME, PERIOD) %>%
+  summarise_all(list(sum),na.rm = T) %>%
+  ungroup()
+
+df_qtrly1 <- df_qtrly %>%
+  mutate(YIELD     = `HTS_TST_POS;Numerator`/`HTS_TST;Numerator`,
+         LINKAGE   = `TX_NEW;Numerator`/`HTS_TST_POS;Numerator`,
+         TX_VOLUME = `TX_CURR;Numerator`) %>%
+  group_by(NAME) %>%
+  mutate(PREV_CURR  = lag(`TX_CURR;Numerator`, order_by = PERIOD),
+         PREV_NEW   = lag(`TX_NEW;Numerator`,  order_by = PERIOD),
+         PREV_CURR2 = lag(PREV_CURR,           order_by = PERIOD),
+         PREV_NEW2  = lag(PREV_NEW,            order_by = PERIOD)) %>%
+  ungroup() %>%
+  mutate(COT              = `TX_CURR;Numerator` / (PREV_CURR + `TX_NET_NEW;Numerator`),
+         TX_DENOM         = (`PREV_CURR` + `TX_NEW;Numerator`),
+         PER_LOSS_GAIN    = (`TX_NET_NEW;Numerator` - `TX_NEW;Numerator`) / `TX_DENOM`,
+         PER_PATIENT_LOSS = (`TX_ML;Numerator` / `TX_DENOM`),
+         PER_STOPPED      = (`TX_ML;Refused Stopped Treatment` / `TX_DENOM`),
+         PER_DIED         = (`TX_ML;Died` / `TX_DENOM`),
+         PER_TRANSFERRED  = (`TX_ML;Transferred Out` / `TX_DENOM`),
+         PER_IIT_LESS3    = (`TX_ML;IIT <3` / ((`TX_NEW;Numerator`/4) + (`PREV_NEW`/2))),
+         PER_IIT_3TO5     = (`TX_ML;IIT 3-5` / ((`PREV_NEW2`/2) + (`PREV_NEW`/2))),
+         PER_IIT_6PLUS    = (`TX_ML;IIT 6+` / `PREV_CURR2`),
+         PER_RETURNED     = (`TX_RTT;Numerator` / (`TX_ML;Numerator` + `TX_RTT;Numerator`)),
+         VL_COVERAGE      = (`TX_PVLS;Denominator`/`PREV_CURR2`),
+         VL_SUPPRESSION  = `TX_PVLS;Numerator`/`TX_PVLS;Denominator`) %>%
+  dplyr::select(NAME, 
+                PERIOD,
+                YIELD, 
+                LINKAGE,
+                COT,
+                PER_LOSS_GAIN, # Same as % Proxy Loss
+                PER_PATIENT_LOSS,
+                PER_IIT_LESS3,
+                PER_IIT_3TO5,
+                PER_IIT_6PLUS,
+                PER_STOPPED,
+                PER_DIED,
+                PER_TRANSFERRED,
+                PER_RETURNED,
+                VL_COVERAGE,
+                VL_SUPPRESSION)
+
+df_qtrly2 <- miss(df_qtrly1)
+
+```
+
+### Principal Component Analysis
+
+Analysis for producing weights for the following year.
+
+1.  Perform PCA and get eigenvalues
+
+-   PCA reduces the dimensionality of the dataset using the principal components of the data.
+
+```{r eigenvalues}
+
+## ==== (a) Get eigenvalues using prcomp function ====
+
+df_calc <- as.data.frame(df6)
+
+site_pr <- lapply(unique(df_calc$PERIOD),
+                  function(x) prcomp(df_calc[df_calc$PERIOD==x, 3:length(df_calc)]))
+# lapply(site_pr, summary)
+
+```
+
+2.  Select components
+
+-   Factors have eigenvalues \> 1;
+-   Factors contribute individually to the explanation of overall variance  \> 10%;
+-   Factors contribute cumulatively to the explanation of overall variance  \> 60%
+
+* We prioritized the first 2 criteria for selection 
+
+```{r, fig.show='hide'}
+site_pr1 <- lapply(unique(df_calc$PERIOD),
+                  function(x) PCA(df_calc[df_calc$PERIOD==x, 3:length(df_calc)]))
+
+round(site_pr1[[1]]$eig,2)
+round(site_pr1[[2]]$eig,2)
+round(site_pr1[[3]]$eig,2)
+```
+
+3.  Inspect biplots and screeplots
+
+-   A biplot is a graphical representation of the PCA results and shows the relationship between the variables in two dimensions.  It shows associations between the data and its attributes.
+    -   The points represent the scores of the observations on the principal components – the points that are close together are observations with similar scores on the components, and therefore the variables.
+
+    -   The vectors represent the coefficients of the variables on the principal component – they point towards the variable that it most represents, and the length of the vector is proportional to the squared multiple correlation between the fitted and actual values for the variable. Vectors pointing in the same direction represent variables that are similar.  If vectors point in opposite directions have least similarity and those pointing to the “middle” are the average.
+-   The scree plot shows the eigenvalues/variances against the number of dimensions.
+
+```{r biplot}
+
+bp <- fviz_pca_biplot(site_pr[[1]], col.var = "red", label = "var", repel = T, alpha = 0.3, min.segment.length = 0) +
+  theme_bw() +
+  theme(plot.title = element_blank())
+bp
+
+bp2 <- fviz_pca_biplot(site_pr[[2]], col.var = "red", label = "var", repel = T, alpha = 0.3, min.segment.length = 0) +
+  theme_bw() +
+  theme(plot.title = element_blank())
+bp2
+
+bp3 <- fviz_pca_biplot(site_pr[[3]], col.var = "red", label = "var", repel = T, alpha = 0.3, min.segment.length = 0) +
+  theme_bw() +
+  theme(plot.title = element_blank())
+bp3
+
+```
+
+```{r scree plot}
+
+sp  <- fviz_eig(site_pr[[1]], addlabels = T) +
+  theme_bw() +
+  theme(plot.title = element_blank())
+sp
+
+sp2 <- fviz_eig(site_pr[[2]], addlabels = T) +
+  theme_bw() +
+  theme(plot.title = element_blank())
+sp2
+
+sp3 <- fviz_eig(site_pr[[3]], addlabels = T) +
+  theme_bw() +
+  theme(plot.title = element_blank())
+sp3
+```
+
+4.  Extract results from variables
+
+-   Extract all the results (coordinates, squared cosine, contributions) for the active individuals/variables from PCA outputs.
+
+```{r results for variables}
+
+site_pr_r <- lapply(site_pr, get_pca_var)
+```
+
+5.  Varimax Rotation of Factors
+
+-   This step maximizes the variance of the factor loadings before weighting.
+
+```{r varimax rotation of factors}
+
+## ==== (a) Retain 2 principal components for weighting ====
+# Change col range end (# of components to be used)
+
+site_pr_r.cor <- lapply(site_pr_r , "[[" , "cor")
+site_pr_r.pc2 <- lapply(site_pr_r.cor, "[", , c("Dim.1", "Dim.2"))
+
+
+## ==== (b) Apply varimax to rotation ====
+# Change col range end (# of components to be used)
+
+site_pr.rotation <- lapply(site_pr, "[[", "rotation")
+site_pr.rotation2 <- lapply(site_pr.rotation, "[", , c("PC1", "PC2"))
+
+varimax.pc2 <- lapply(lapply(site_pr.rotation2, scale), varimax)
+weight_loadings <- lapply(varimax.pc2, "[[", "loadings")
+
+
+## ==== (c) Extract loadings and turn into dataframe ====
+# quarter (still not a df, but now a list of dfs)
+
+weight_loadings_df <- lapply(weight_loadings, function(x)
+  data.frame(matrix(as.numeric(x),
+                    attributes(x)$dim,
+                    dimnames=attributes(x)$dimnames)))
+
+```
+
+6.  Weights
+
+-   We'll use the factor loadings to calculate the table of weights.
+-   Square all of the loadings to remove any negative values.
+-   Normalize the weights so they sum to 1.
+-   Multiply by the proportion explained variance of each factor.
+-   Finally, take the maximum loading from each factor.
+
+```{r weight extraction, results='hide'}
+
+# We can finally move onto the extraction of our weights for each variable. 
+# Weights are selected from the max contribution across the principal components 
+# meeting the criteria.
+
+
+## ==== (a) Square loadings for each sub-indicator ====
+
+normalized_loadings <- lapply(weight_loadings_df, function(x) x^2)
+prop_total_variance <- lapply(normalized_loadings, colSums)
+
+
+## ==== (b) Divide each square factor variance by explained variance of each factor ====
+# Normalize using colSums so weights sum to 1
+
+normalized_loadings_divide <- lapply(normalized_loadings, function(x) 
+  apply(x, 2, function(x) (x/sum(x))))
+lapply(normalized_loadings_divide, colSums)
+
+
+## ==== (c) Multiply normalized factor loadings by proportion explained variance of each factor ====
+# Scale loadings by column sums then multiply by the proportion of the column sums
+
+prop_tot <- lapply(prop_total_variance, prop.table)
+prop_apply <- Map('*', normalized_loadings_divide, prop_tot)
+
+
+## ==== (d) Determine weights for each sub-indicator using the max ====
+
+normalized_loadings.t <- lapply(prop_apply, t)
+weights <- lapply(normalized_loadings.t, function(x) apply(x, MARGIN = 2,
+                                                           FUN = max, na.rm = TRUE))
+# weights
+
+
+## ==== (e) Turn list into a list of dataframe ====
+weights.list <- lapply(lapply(weights,t), function(x)
+  data.frame(matrix(as.numeric(x),
+                    attributes(x)$dim,
+                    dimnames=attributes(x)$dimnames)))
+
+
+## ==== (f) Collapse list into a single dataframe ====
+
+names(weights.list) <- names(table(df_calc$PERIOD))
+for (n in names(weights.list))
+  weights.list[[n]]['PERIOD'] = n
+
+weights.df <- bind_rows(weights.list)
+
+
+## ==== (g) Turn loss weights negative ====
+
+weights.df["PER_PATIENT_LOSS"] <- weights.df["PER_PATIENT_LOSS"] *-1
+weights.df["PER_IIT_LESS3"]    <- weights.df["PER_IIT_LESS3"] *-1
+weights.df["PER_IIT_3TO5"]     <- weights.df["PER_IIT_3TO5"] *-1
+weights.df["PER_IIT_6PLUS"]    <- weights.df["PER_IIT_6PLUS"] *-1
+weights.df["PER_TRANSFERRED"]  <- weights.df["PER_TRANSFERRED"] *-1
+weights.df["PER_STOPPED"]      <- weights.df["PER_STOPPED"] *-1
+weights.df["PER_DIED"]         <- weights.df["PER_DIED"] *-1
+
+```
+
+7.  Aggregation
+
+-   Join each set of annual weights to the following year's qtrly results.
+-   Multiply each weight with their corresponding result.
+-   Sum the weighted results.
+-   Rank the sites by composite score.
+
+```{r format qtrly}
+
+## ==== (a) Separate the FY from the PERIOD for upcoming join in qtrly ====
+
+df_qtrly3 <- df_qtrly2 %>%
+  separate(PERIOD, 
+           into = c("PERIOD", "ATTRIBUTE"), 
+           sep = "_")
+
+
+## ==== (b) Remove the "_" from the col names in qtrly ====
+
+names(df_qtrly3) <- gsub(x = names(df_qtrly3), pattern = "\\_", replacement = ".")  
+
+
+## ==== (c) Remove the "_" from the col names in weights df ====
+
+weights.df.merge <- weights.df
+names(weights.df.merge) <- gsub(x = names(weights.df.merge), pattern = "\\_", replacement = ".")
+
+
+## ==== (d) Add "Wt" in front of the weight columns ====
+
+colnames(weights.df.merge) <- paste("Wt", colnames(weights.df.merge), sep = "_")
+names(weights.df.merge)[names(weights.df.merge) == 'Wt_PERIOD'] <- 'PERIOD'
+
+
+## ==== (e) Move the weight PERIOD up 1 ====
+weights.df.merge2 <- weights.df.merge %>%
+  mutate(PERIOD = as.numeric(PERIOD),
+         PERIOD = PERIOD + 1,
+         PERIOD = as.character(PERIOD))
+
+## ==== (f) Inner join to the qtrly df using the PERIOD ====
+
+weights.df.apply <- merge(df_qtrly3, weights.df.merge2, by = "PERIOD")
+
+
+## ==== (g) Multiply the weights across the qtrly KPIs ====
+
+weights.df.apply2 <- weights.df.apply %>%
+  unite("PERIOD",
+        c(PERIOD, ATTRIBUTE),
+        remove = T) %>%
+  pivot_longer(!c(NAME, PERIOD)) %>%
+  mutate(name = gsub("Wt_", "", name)) %>%
+  group_by(NAME, PERIOD, name) %>%
+  summarize(value = prod(value)) %>%
+  ungroup %>%
+  pivot_wider %>%
+  as.data.frame
+
+
+## ==== AGGREGATE ====
+
+## ==== (a) Sum the weighted KPIs ====
+
+final <- as.data.frame(cbind(NAME=weights.df.apply2[,1], 
+                             PERIOD=weights.df.apply2[,2],
+                             "Composite Indicator"=rowSums(weights.df.apply2[,3:length(weights.df.apply2)], na.rm=T)))
+
+
+## ==== RANK ====
+
+## ==== (a) Rank the composite indicators by PERIOD ====
+
+final2 <- final %>%
+  separate(NAME,
+           c("Name", "UID", "PSNU", "PSNUUID"),
+           sep = ";"
+  ) %>%
+  group_by(PERIOD) %>%
+  mutate(`Composite Indicator` = as.numeric(`Composite Indicator`),
+         `Rank in Period`      = dense_rank(desc(`Composite Indicator`)),
+         p_avg                 = mean(`Rank in Period`)) %>%
+  # Remove if average rank is 1 (means all composite scores are the same, most likely the qtr has not happened yet)
+  ungroup() %>%
+  filter(p_avg != 1) %>%
+  dplyr::select(-p_avg)
+
+```
+
+## Results
+
+### Weights
+
+#### Table 1. Weights
+
+Inspect the weights in this table to see how KPI's are weighted over time. Remember the weights for each year come from the previous year's MER indicator results. Do you agree with these weights?
+
+Use the buttons to download the dataset.
+
+```{r weight table, warning = FALSE}
+
+datatable(weights.df %>%
+            mutate(PERIOD = as.numeric(PERIOD) + 1) %>%
+            pivot_longer(YIELD:VL_SUPPRESSION, values_to = "Weight", names_to = "KPI") %>%
+            mutate(Weight = round(Weight,3)) %>%
+            pivot_wider(names_from = "PERIOD", values_from = "Weight"), 
+          rownames = F,
+          extensions = 'Buttons', 
+          options = list(
+            pageLength = 14,
+            dom = 'Brti',
+            buttons = c('copy', 'csv', 'excel')
+          )
+)
+
+```
+
+#### Figure 1. Weight Bar Plot
+
+```{r weight bar plot, warning = FALSE}
+
+f1 <- weights.df %>%
+  pivot_longer(YIELD:VL_SUPPRESSION, values_to = "Weight", names_to = "KPI") %>%
+  ggplot(aes(x = KPI, y = Weight, fill = PERIOD, colour = PERIOD)) +
+  geom_col(stat = "identity", position = "dodge") +
+  coord_flip() +
+  theme_bw() +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.position = "top",
+        axis.text.x = element_text(angle = 90),
+        axis.title.y = element_blank())
+
+f1
+
+```
+
+### Composite By Site
+
+#### Figure 2. Distribution by KPI (Most Recent Quarter)
+
+Hover your mouse over a point to see what site it is. Use the controls on the upper right-hand corner of the plot to zoom in.
+
+See how your sites are distributed by KPI for the most recent quarter. Do you see any outliers? Are they expected outliers or maybe potential data quality issues?
+
+```{r site range, warning = FALSE, message = FALSE}
+# 
+# Alternative dot plots
+# f2 <- df_qtrly2 %>%
+#   separate(NAME,
+#            c("Name", "UID", "PSNU", "PSNUUID"),
+#            sep = ";"
+#   ) %>%
+#   pivot_longer(YIELD:VL_SUPPRESSION, names_to="KPI", values_to="Value") %>%
+#   filter(PERIOD==max(.$PERIOD)) %>%
+#   ggplot(aes(Value, KPI)) +
+#   geom_point(aes(colour = KPI, text = Name)) +
+#   theme_bw() +
+#   theme(panel.grid.major.y = element_blank(),
+#         panel.grid.minor.y = element_blank(),
+#         legend.position = "none",
+#         axis.title.y = element_blank())
+# 
+# ggplotly(f2)
+
+# Density plots
+f2 <- ggplot(df_qtrly2 %>%
+               separate(NAME,
+                        c("Name", "UID", "PSNU", "PSNUUID"),
+                        sep = ";"
+               ) %>%
+               filter(PERIOD==max(.$PERIOD)) %>%
+               pivot_longer(YIELD:VL_SUPPRESSION, names_to="KPI", values_to="Value"), aes(x = Value, y = KPI, group = KPI)) + 
+  geom_density_ridges(fill = "#619CFF", rel_min_height = 0.01) +
+  theme_bw() +
+  xlim(-0.25,1.2) +
+  theme(axis.title.y = element_blank())
+
+f2
+
+```
+
+#### Table 2. Top 10 Performers
+
+These are the top sites according to the composite indicator. Do they agree with your experience?
+
+Use the buttons to download the dataset.
+
+```{r}
+
+datatable(final2 %>%
+            filter(`Rank in Period` <= 10) %>%
+            arrange(PERIOD, `Rank in Period`) %>%
+            dplyr::select(Name, PERIOD, `Rank in Period`) %>%
+            pivot_wider(names_from = PERIOD, values_from = Name), 
+          rownames = F,
+          extensions = 'Buttons', 
+          options = list(
+            pageLength = 14,
+            dom = 'Brti',
+            buttons = c('copy', 'csv', 'excel')
+          )
+)
+
+```
+
+#### Table 3. Bottom 10 Performers
+
+These are the bottom sites according to the composite indicator. Do they agree with your experience?
+
+Use the buttons to download the dataset.
+
+```{r}
+
+datatable(final2 %>%
+            group_by(PERIOD) %>% 
+            arrange(`Rank in Period`) %>% 
+            slice_tail(n = 10) %>%
+            arrange(desc(`Rank in Period`)) %>%
+            mutate(ROW = row_number()) %>%
+            ungroup() %>%
+            arrange(PERIOD) %>%
+            dplyr::select(Name, PERIOD, ROW) %>%
+            pivot_wider(names_from = PERIOD, values_from = Name), 
+          rownames = F,
+          extensions = 'Buttons', 
+          options = list(
+            pageLength = 14,
+            dom = 'Brti',
+            buttons = c('copy', 'csv', 'excel')
+          )
+)
+
+```
+
+#### Table 3. Site List
+
+Note, this list includes all qtrs. Use the column filter to reduce the qtrs shown. Use the buttons to export out the results and do further analysis, deep dives, etc. For a dataset including the components used to calculate the composite indicators, see the Appendix.
+
+Use the buttons to download the dataset.
+
+```{r, warning = FALSE}
+
+datatable(final2 %>%
+            dplyr::select(-c(UID, PSNUUID)) %>%
+            mutate(`Composite Indicator` = round(`Composite Indicator`, 3)) %>%
+            arrange(desc(PERIOD), `Rank in Period`),
+          filter = 'top', 
+          rownames = F,
+          extensions = c('Buttons', 'RowGroup'), 
+          options = list(
+            pageLength = 14,
+            rowGroup = list(dataSrc = 2),
+            dom = 'BFrtip',
+            buttons = c('copy', 'csv', 'excel')
+          )
+)
+
+```
+
+#### Figure 3. Site Map (Most Recent Quarter)
+
+Click on a point to see its details.
+
+```{r, warning = FALSE}
+
+Sites <- read.csv("Geo/PEPFAR_ALL_OUs_HF_2020.csv") %>%
+  right_join(final2, by = c("uid"="UID")) %>%
+  filter(PERIOD==max(.$PERIOD)) %>%
+  filter(!is.na(LAT) | !is.na(LONG)) %>% 
+  st_as_sf(coords = c("LONG", "LAT"), 
+           crs = 4326)
+
+mapview(Sites, zcol="Composite Indicator", col.regions=paletteer_c("ggthemes::Red-Green-Gold Diverging", 7))
+
+```
+
+### Composite By PSNU
+
+Analyze the results by PSNU.
+
+#### Figure 4. PSNU Trends
+
+Hover your mouse over a point to see what PSNU it is.
+
+How are the mean composite scores for your PSNUs trending? Which PSNUs are increasing/decreasing/stable?
+
+```{r, warning = F}
+
+psnu_scores <- final2 %>%
+  group_by(PSNU, PSNUUID, PERIOD) %>%
+  summarize(Composite = mean(`Composite Indicator`, na.rm = T)) %>%
+  ungroup()
+
+f4 <- ggplot(psnu_scores, aes(x=PERIOD, y=Composite, colour = PSNU, group=PSNU)) +
+  geom_point() + 
+  geom_line() + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90),
+        legend.position = "none",
+        axis.title.x = element_blank())
+
+ggplotly(f4)
+
+```
+
+#### Figure 5. Site Distribution by PSNU (Most Recent Quarter)
+
+Each point represents a site in the PSNU. The line marks the median.
+
+```{r}
+
+# Change outlier, color, shape and size
+f5 <- ggplot(final2 %>%
+               filter(PERIOD == max(.$PERIOD)), aes(x = PSNU, y = `Composite Indicator`, colour = PSNU)) + 
+  geom_jitter(position = position_jitter(0.2), cex = 0.7) +
+  stat_summary(fun = median, geom = "point", shape = 95,
+               size = 2, color = "black") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 75),
+        axis.title.x = element_blank(),
+        legend.position = 'none'
+  )
+
+ggplotly(f5)
+
+```
+
+#### Figure 6. PSNU Chloropeth (Most Recent Quarter)
+
+Click on a PSNU on the map to bring up more information.
+
+Identify high and low performing PSNUs. Does this caegorization agree with your experience? Do you already know what might be causing low performance?
+
+```{r, warning = F}
+
+`Figure 6` <- read_sf("Geo/PepfarPolygonsFullTable.shp") %>%
+  right_join(psnu_scores %>%
+               filter(PERIOD==max(.$PERIOD)), by = c("uid"="PSNUUID"))
+
+mapview(`Figure 6`, zcol = "Composite", col.regions = paletteer_c("ggthemes::Red-Green-Gold Diverging", 6))
+
+```
+
+#### Figure 7. PSNU Heatmap (Most Recent Quarter)
+
+This heatmap shows the PSNUs' ranked KPI value for each area. Note, the heatmap is showing only the most recent quarter. For example, a PSNU with green in their KPI category is doing better compared to the other PSNUs, and a PSNU with more greens across their KPIs would be doing better overall compared to the other PSNUs. PSNUs arranged on the left side of the heatmap are doing better per composite indicator.
+
+```{r}
+
+psnu_scores_recent <- psnu_scores %>%
+  filter(PERIOD==max(.$PERIOD)) %>%
+  arrange(desc(Composite))
+
+psnu_kpi_rank <- df_qtrly2 %>%
+  separate(NAME,
+           c("Name", "UID", "PSNU", "PSNUUID"),
+           sep = ";"
+  ) %>%
+  filter(PERIOD==max(.$PERIOD)) %>%
+  group_by(PSNU, PERIOD) %>%
+  summarize(across(where(is.numeric), mean)) %>%
+  ungroup() %>%
+  mutate(`a. YIELD`             = dense_rank(desc(YIELD)),
+         `b. LINKAGE`           = dense_rank(desc(LINKAGE)),
+         `c. COT`               = dense_rank(desc(COT)),
+         `d. PER_LOSS_GAIN`     = dense_rank(desc(PER_LOSS_GAIN)),
+         `e. PER_PATIENT_LOSS`  = dense_rank(PER_PATIENT_LOSS),
+         `f. PER_IIT_LESS3`     = dense_rank(PER_IIT_LESS3),
+         `g. PER_IIT_3TO5`      = dense_rank(PER_IIT_3TO5),
+         `h. PER_IIT_6PLUS`     = dense_rank(PER_IIT_6PLUS),
+         `i. PER_TRANSFERRED`   = dense_rank(PER_TRANSFERRED),
+         `j. PER_STOPPED`       = dense_rank(PER_STOPPED),
+         `k. PER_DIED`          = dense_rank(PER_DIED),
+         `l. PER_RETURNED`      = dense_rank(desc(PER_RETURNED)),
+         `m. VL_COVERAGE`       = dense_rank(desc(VL_COVERAGE)),
+         `n. VL_SUPPRESSION`    = dense_rank(desc(VL_COVERAGE))) %>%
+  select(PSNU, PERIOD, `a. YIELD`:`n. VL_SUPPRESSION`) %>%
+  pivot_longer(`a. YIELD`:`n. VL_SUPPRESSION`, names_to="KPI", values_to="Value")
+
+psnu_kpi_rank$PSNU <- factor(psnu_kpi_rank$PSNU, levels = psnu_scores_recent$PSNU)
+
+f7 <- psnu_kpi_rank %>%
+  ggplot(aes(PSNU, KPI, fill=Value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradientn(colors = paletteer_c("ggthemes::Red-Green-Gold Diverging", 30, direction = -1)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90),
+        legend.position = "top",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+f7
+
+```
+
+### Composite By Partner
+
+Hover your mouse over a point to see what PSNU it is.
+
+A site belongs to a partner if its TX_CURR is not equal to NA, 0, or negative.
+
+#### Figure 8. Partner Trends
+
+```{r, warning = F}
+
+partner_meta <- df1 %>%
+  filter(indicator == "TX_CURR") %>%
+  group_by(
+    facilityuid, prime_partner_name, indicator, standardizeddisaggregate, otherdisaggregate, fiscal_year
+  ) %>%
+  summarise(cumulative = sum(cumulative, na.rm=T)) %>%
+  ungroup() %>%
+  filter(cumulative > 0) %>%
+  select(facilityuid, prime_partner_name, fiscal_year) %>%
+  distinct() # %>%
+# group_by(facilityuid, fiscal_year) %>%
+# mutate(count = n()) %>% # Check for duplicates
+# ungroup() %>%
+
+final2_with_partner <- partner_meta %>%
+  right_join(final2 %>%
+               separate(PERIOD, into=c("fiscal_year", "attribute"), sep = "_", remove = F), by = c("facilityuid" = "UID", "fiscal_year" = "fiscal_year")) 
+
+partner_scores <- final2_with_partner %>%
+  group_by(prime_partner_name, PERIOD) %>%
+  summarize(Composite = mean(`Composite Indicator`, na.rm = T)) %>%
+  ungroup()
+
+f8 <- ggplot(partner_scores, aes(x=PERIOD, y=Composite, colour = prime_partner_name, group=prime_partner_name)) +
+  geom_point() + 
+  geom_line() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90),
+        legend.position = "none",
+        legend.title = element_blank(),
+        axis.title.x = element_blank())
+
+ggplotly(f8)
+
+```
+
+#### Figure 9. Site Distribution by Partner (Most Recent Quarter)
+
+Hover your mouse over a point to see what site it is.
+
+The black line represents the median for each Partner.
+
+```{r, warning = F}
+
+f9 <- ggplot(final2_with_partner %>%
+               filter(PERIOD == max(.$PERIOD)), 
+             aes(x = prime_partner_name, y = `Composite Indicator`, colour = prime_partner_name)) + 
+  geom_jitter(aes(label = Name), position = position_jitter(0.2), cex = 0.7) +
+  stat_summary(fun = median, geom = "point", shape = 95,
+               size = 2, color = "black") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90),
+        axis.title.x = element_blank(),
+        legend.position = 'none'
+  )
+
+ggplotly(f9)
+
+```
+
+#### Figure 10. Partner Heatmap (Most Recent Quarter)
+
+This heatmap shows the Partner's ranked KPI value for each area. Note, the heatmap is showing only the most recent quarter. For example, a Partner with green in their KPI category is doing better compared to the other Partners, and a Partner with more greens across their KPIs would be doing better overall compared to the other Partners. Partners arranged on the left side of the heatmap are doing better per composite indicator.
+
+```{r}
+
+partner_scores_recent <- partner_scores %>%
+  filter(PERIOD==max(.$PERIOD)) %>%
+  arrange(desc(Composite))
+
+partner_kpi_rank <- df_qtrly2 %>%
+  separate(NAME,
+           c("Name", "UID", "PSNU", "PSNUUID"),
+           sep = ";"
+  ) %>%
+  separate(PERIOD, into=c("fiscal_year", "attribute"), sep = "_", remove = F) %>%
+  left_join(partner_meta, by = c("UID" = "facilityuid", "fiscal_year" = "fiscal_year")) %>%
+  filter(PERIOD==max(.$PERIOD)) %>%
+  group_by(prime_partner_name, PERIOD) %>%
+  summarize(across(where(is.numeric), mean)) %>%
+  ungroup() %>%
+  mutate(`a. YIELD`             = dense_rank(desc(YIELD)),
+         `b. LINKAGE`           = dense_rank(desc(LINKAGE)),
+         `c. COT`               = dense_rank(desc(COT)),
+         `d. PER_LOSS_GAIN`     = dense_rank(desc(PER_LOSS_GAIN)),
+         `e. PER_PATIENT_LOSS`  = dense_rank(PER_PATIENT_LOSS),
+         `f. PER_IIT_LESS3`     = dense_rank(PER_IIT_LESS3),
+         `g. PER_IIT_3TO5`      = dense_rank(PER_IIT_3TO5),
+         `h. PER_IIT_6PLUS`     = dense_rank(PER_IIT_6PLUS),
+         `i. PER_TRANSFERRED`   = dense_rank(PER_TRANSFERRED),
+         `j. PER_STOPPED`       = dense_rank(PER_STOPPED),
+         `k. PER_DIED`          = dense_rank(PER_DIED),
+         `l. PER_RETURNED`      = dense_rank(desc(PER_RETURNED)),
+         `m. VL_COVERAGE`       = dense_rank(desc(VL_COVERAGE)),
+         `n. VL_SUPPRESSION`    = dense_rank(desc(VL_COVERAGE))) %>%
+  select(prime_partner_name, PERIOD, `a. YIELD`:`n. VL_SUPPRESSION`) %>%
+  pivot_longer(`a. YIELD`:`n. VL_SUPPRESSION`, names_to="KPI", values_to="Value")
+
+partner_kpi_rank$prime_partner_name <- factor(partner_kpi_rank$prime_partner_name, levels = partner_scores_recent$prime_partner_name)
+
+f10 <- partner_kpi_rank %>%
+  ggplot(aes(prime_partner_name, KPI, fill=Value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradientn(colors = paletteer_c("ggthemes::Red-Green-Gold Diverging", 30, direction = -1)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90),
+        legend.position = "top",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+f10
+
+```
+
+### Appendix
+
+#### Table I. Component Indicator and Components by Site
+
+Use the buttons to download the dataset.
+
+```{r, warning = F, message = F}
+dataset <-   weights.df.apply %>%
+  unite(PERIOD, c(PERIOD, ATTRIBUTE), sep = "_") %>%
+  separate(NAME,
+           c("Name", "UID", "PSNU", "PSNUUID"),
+           sep = ";"
+  ) %>%
+  left_join(final2)
+
+datatable(
+  dataset,
+  extensions = c('Buttons', 'FixedColumns'), 
+  options = list(
+    dom = 'Brti',
+    scrollX = TRUE,
+    scrollCollapse = TRUE,
+    
+    buttons = c('copy', 'csv', 'excel')
+  )
+)
+
+```
+
+
+
+```{r white paper figs, include = F}
+ggsave("figs/sitedist.png", f2, width = 7, height = 5, dpi = 1200)
+ggsave("figs/weights.png", f1, width = 7, height = 5, dpi = 1200)
+ggsave("figs/biplot.png", bp, width = 10, height = 5, dpi = 1200)
+ggsave("figs/biplot2.png", bp2, width = 10, height = 5, dpi = 1200)
+ggsave("figs/biplot3.png", bp3, width = 10, height = 5, dpi = 1200)
+ggsave("figs/scree.png", sp, width = 7, height = 5, dpi = 1200)
+ggsave("figs/scree2.png", sp2, width = 7, height = 5, dpi = 1200)
+ggsave("figs/scree3.png", sp3, width = 7, height = 5, dpi = 1200)
+```
